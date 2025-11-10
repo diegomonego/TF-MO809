@@ -1,0 +1,241 @@
+# server.py (VERSÃO FINAL OTIMIZADA)
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import numpy as np
+import socket
+from model import PokemonCNN
+from utils import receive_data
+import torchvision.transforms as T
+from dataset import PokemonCSVDataset 
+
+# --- Configurações ---
+HOST = '127.0.0.1' 
+PORT = 65432
+MODEL_PATH = 'pokemon_model.pth'
+IMG_SIZE = 64
+
+# --- ATENÇÃO: Caminhos ---
+CSV_PATH = '../DATASETS/Pokemon.csv'    
+IMAGE_DIR = '../DATASETS/all_pokemon/'  
+
+# --- Hiperparâmetros do Ataque DLG (CORRIGIDOS/OTIMIZADOS) ---
+# Otimização: LR mais estável e TV inicial mais fraca
+adam_lr = 0.01          # AJUSTE: Mais estável que 0.5
+adam_iters = 20000       
+lbfgs_iters = 250       
+lambda_tv_start = 1e-5  # AJUSTE: Reduzido de 1e-2 para 1e-3 para evitar esmagar a loss_g
+lambda_tv_end = 1e-6
+lambda_l2 = 1e-10        # AJUSTE: Reduzido de 1e-5 para 1e-6 (penalidade de pixel mais fraca)
+use_cosine = True
+save_every = 500
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Servidor usando device: {device}")
+
+# --- Pré-carregar dataset (permanece igual) ---
+print("Carregando dataset para obter metadados...")
+try:
+    temp_transform = T.Compose([T.Resize((IMG_SIZE, IMG_SIZE)), T.ToTensor()])
+    temp_dataset = PokemonCSVDataset(csv_file=CSV_PATH, img_dir=IMAGE_DIR, transform=temp_transform)
+    NUM_CLASSES = len(temp_dataset.classes)
+    print(f"Número de classes detectado: {NUM_CLASSES}")
+    del temp_dataset 
+except FileNotFoundError:
+    print(f"ERRO: Não foi possível encontrar os arquivos do dataset em {CSV_PATH} ou {IMAGE_DIR}")
+    exit()
+except Exception as e:
+    print(f"ERRO ao carregar dataset temporário: {e}. Verifique os nomes das colunas no dataset.py")
+    exit()
+
+# --- Funções Utilitárias (permanecem iguais) ---
+def total_variation(x):
+    h = ((x[:,:,1:,:] - x[:,:,:-1,:])**2).sum()
+    w = ((x[:,:,:,1:] - x[:,:,:,:-1])**2).sum()
+    return h
+
+def norm_grad_tensor(g):
+    return g / (g.norm() + 1e-10)
+
+def gradient_matching_loss_normalized(grads_pred, grads_true, use_cosine=True):
+    mse = 0.0
+    cosine = 0.0
+    for gp, gt in zip(grads_pred, grads_true):
+        gn_p = norm_grad_tensor(gp)
+        gn_t = norm_grad_tensor(gt.to(gp.device))
+        mse = mse + ((gp - gn_t)**2).mean()
+        if use_cosine:
+            cosine = cosine + (1.0 - torch.nn.functional.cosine_similarity(gn_p.view(-1), gn_t.view(-1), dim=0))
+    return mse + (0.1 * cosine if use_cosine else 0.0)
+
+def denormalize(img_tensor):
+    mean = [0.5, 0.5, 0.5]
+    std = [0.5, 0.5, 0.5]
+    denorm = T.Normalize(mean=[-m/s for m, s in zip(mean, std)], std=[1/s for s in std])
+    return denorm(img_tensor)
+
+# --- Preparar Modelo (permanece igual) ---
+try:
+    model = PokemonCNN(num_classes=NUM_CLASSES).to(device)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+    print("Modelo treinado (pokemon_model.pth) carregado com sucesso.")
+except Exception as e:
+    print(f"ERRO ao carregar o modelo: {e}")
+    exit()
+
+
+# --- Loop Principal do Servidor ---
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.bind((HOST, PORT))
+    s.listen()
+    print(f"Servidor escutando em {HOST}:{PORT}...")
+    conn, addr = s.accept()
+
+    with conn:
+        print(f"Conexão recebida de {addr}")
+
+        # 1. Receber os dados do cliente (permanece igual)
+        received_data = receive_data(conn)
+        if received_data is None:
+            print("Falha ao receber dados. Encerrando.")
+            exit()
+
+        target_grads = received_data['gradients']
+        target_label_idx = received_data['label_idx']
+        target_label_name = received_data.get('label_name', str(target_label_idx))
+        secret_image_idx = received_data['secret_image_idx']
+        
+        target_label = torch.tensor([target_label_idx], dtype=torch.long).to(device)
+        
+        print(f"Gradientes recebidos. Rótulo alvo: {target_label_idx} ({target_label_name})")
+        print(f"Índice da imagem secreta: {secret_image_idx}")
+        print("Iniciando ataque DLG...")
+
+        # 2. Preparar Imagem Dummy (permanece igual)
+        dummy_img = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).to(device).requires_grad_(True)
+
+        def get_grads(x, y):
+            model.zero_grad()
+            loss = criterion(model(x), y)
+            return torch.autograd.grad(loss, model.parameters(), create_graph=True)
+
+        # 3. Executar Ataque DLG (ADAM)
+        print("\n--- Otimização Adam (Warm-up) ---")
+        optimizer = optim.Adam([dummy_img], lr=adam_lr)
+        best_loss = float('inf')
+        best_img_adam = dummy_img.detach().clone()
+        
+        for i in range(adam_iters):
+            optimizer.zero_grad()
+            
+            # Usar tanh() é uma ótima ideia para manter o range [-1, 1] (pós-normalização)
+            clipped = torch.tanh(dummy_img) 
+            
+            grads_pred = get_grads(clipped, target_label)
+            
+            t = i / max(1, adam_iters-1)
+            lambda_tv = lambda_tv_start * (1 - t) + lambda_tv_end * t
+            
+            loss_g = gradient_matching_loss_normalized(grads_pred, target_grads, use_cosine)
+            tv = total_variation(clipped)
+            l2im = torch.mean(clipped**2)
+            loss = loss_g + lambda_tv * tv + lambda_l2 * l2im
+            
+            loss.backward()
+            optimizer.step()
+            
+            if (i+1) % save_every == 0:
+                print(f"[Adam {i+1}/{adam_iters}] loss_g={loss_g.item():.6e} total={loss.item():.6e}")
+            
+            if loss_g.item() < best_loss:
+                best_loss = loss_g.item()
+                best_img_adam = clipped.detach().clone()
+
+        # --- BÔNUS: Refinamento LBFGS (CORRIGIDO) ---
+        print("\n--- Refinamento LBFGS ---")
+
+        # 1. Copia os DADOS do melhor Adam para a imagem dummy DENTRO do no_grad
+        with torch.no_grad():
+            dummy_img.copy_(best_img_adam)
+
+        # 2. Reafirma o requires_grad
+        dummy_img.requires_grad_(True) 
+
+        # 3. Inicializa o LBFGS
+        lbfgs_opt = torch.optim.LBFGS([dummy_img], max_iter=20, lr=0.001, history_size=10)
+
+        def lbfgs_closure():
+            lbfgs_opt.zero_grad()
+            
+            # Recria o grafo de computação a cada passo
+            clipped = torch.tanh(dummy_img) 
+            
+            grads_pred = get_grads(clipped, target_label)
+            loss_g = gradient_matching_loss_normalized(grads_pred, target_grads, use_cosine)
+            tv = total_variation(clipped)
+            # Usa lambda_tv_end para a fase de refinamento
+            #loss = loss_g + lambda_tv_end * tv + lambda_l2 * torch.mean(clipped**2)
+            loss = loss_g + lambda_l2 * torch.mean(clipped**2)
+            loss.backward()
+            
+            return loss # Retorna o tensor loss, o LBFGS lida com o escalar
+
+        # --- Loop Otimizado do LBFGS ---
+        for step in range(lbfgs_iters):
+            
+            # O .step(closure) executa a closure e a otimização, e retorna a perda do passo
+            loss_total_val = lbfgs_opt.step(lbfgs_closure).item() # <--- CORREÇÃO CRÍTICA
+
+            if (step+1) % 50 == 0:
+                # Calculamos a loss_g SOMENTE para log, usando o estado atual do dummy_img
+                # Usamos no_grad e NÃO chamamos get_grads, mas sim uma única passagem de loss_g
+                
+                # RECALCULAR loss_g PARA LOG DENTRO DO NO_GRAD (forma mais segura)
+                with torch.no_grad():
+                    clipped_log = torch.tanh(dummy_img) 
+                    
+                    # Para obter gradientes para o log, precisamos rodar a loss.backward()
+                    # A maneira mais fácil é usar a closure (que já faz o backward) e capturar a perda G do log
+                    
+                    # Vamos simplificar: Apenas rode a closure e capture o loss total para log
+                    # Não vamos tentar capturar loss_g separada aqui, pois ela exige o 'get_grads' problemático
+                    pass
+
+                print(f"[LBFGS {step+1}/{lbfgs_iters}] total={loss_total_val:.6e}")
+        
+        print("Ataque DLG (Adam + LBFGS) concluído.")
+        
+        # Pega a imagem final otimizada
+        final_clipped = torch.tanh(dummy_img)
+        # final_clipped = best_img_adam
+
+        print("Carregando imagem original para comparação...")
+        
+        transform_vis = T.Compose([T.Resize((IMG_SIZE, IMG_SIZE)), T.ToTensor()])
+        vis_dataset = PokemonCSVDataset(csv_file=CSV_PATH, img_dir=IMAGE_DIR, transform=transform_vis)
+        
+        img_true_vis, _ = vis_dataset[secret_image_idx] 
+        img_true_vis = img_true_vis.unsqueeze(0) 
+
+        img_recon = denormalize(final_clipped.detach().cpu().squeeze(0)) 
+        img_recon = img_recon.permute(1, 2, 0).numpy() 
+
+        img_true_vis = img_true_vis.squeeze(0).permute(1, 2, 0).numpy()
+
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.imshow(np.clip(img_true_vis, 0, 1))
+        plt.title(f"Original (Classe: {target_label_name})")
+        plt.axis('off')
+
+        plt.subplot(1, 2, 2)
+        plt.imshow(np.clip(img_recon, 0, 1))
+        plt.title("Reconstruída pelo DLG (Adam + LBFGS)")
+        plt.axis('off')
+
+        plt.suptitle("Resultado do Ataque de Inversão de Gradiente")
+        plt.show()
