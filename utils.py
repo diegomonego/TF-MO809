@@ -283,10 +283,10 @@ class MNISTCNN(nn.Module):
         )
 
     def forward(self, x):
-        x = self.conv_layers(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc_layers(x)
-        return x
+        out = self.body(x)
+        out = out.contiguous().view(out.size(0), -1)  # Adiciona .contiguous()
+        out = self.fc(out)
+        return out
 
 class LeNet(nn.Module):
     """
@@ -313,7 +313,6 @@ class LeNet(nn.Module):
 
     def forward(self, x):
         out = self.body(x)
-        out = out.view(out.size(0), -1)
+        out = out.contiguous().view(out.size(0), -1)  # Adiciona .contiguous()
         out = self.fc(out)
-        
         return out
